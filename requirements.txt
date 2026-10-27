@@ -1,0 +1,7 @@
+# Pin <5: OpenCV 5 da xoa cv2.CascadeClassifier, va mediapipe keo
+# opencv-contrib-python 5.x de len -> phai pin ca hai goi.
+opencv-python<5
+opencv-contrib-python<5
+mediapipe>=1.0
+numpy>=1.24
+pyautogui
