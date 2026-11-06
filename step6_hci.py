@@ -1,77 +1,125 @@
-import sys
-import time, cv2, mediapipe as mp
-from mediapipe.tasks import python as P
-from mediapipe.tasks.python import vision
-LI=range(468,473); RI=range(473,478); LC=(33,133); RC=(362,263)
-EL=[33,160,158,133,153,144]; ER=[362,385,387,263,373,380]
-REAL = "--real" in sys.argv
-py = None
-if REAL:
-    import pyautogui as py
-    py.FAILSAFE = True
-A,AV=0.35,0.32; DZX,DZU,DZD=0.08,0.02,0.035
-ETH,DW,CD=0.20,12,0.5
-CMD={"PHAI":"NEXT","TRAI":"PREV","LEN":"SCROLL UP","XUONG":"SCROLL DOWN"}
-def ear(p,i):
-    a,b,c,d,e,f=(p[k] for k in i)
-    g=lambda u,v:((u[0]-v[0])**2+(u[1]-v[1])**2)**.5
-    return (g(b,f)+g(c,e))/(2*g(a,d)+1e-6)
-def rt(p,ir,c):
-    ix=sum(p[k][0] for k in ir)/5; iy=sum(p[k][1] for k in ir)/5
-    x1,x2=p[c[0]][0],p[c[1]][0]; y0=(p[c[0]][1]+p[c[1]][1])/2; w=abs(x2-x1)+1e-6
-    return (ix-min(x1,x2))/w,(iy-y0)/w
-def cls(dx,dy):
-    dz=DZD if dy>0 else DZU
-    if abs(dx)<DZX and abs(dy)<dz: return "THANG"
-    if abs(dx)/DZX>=abs(dy)/dz: return "PHAI" if dx>0 else "TRAI"
-    return "XUONG" if dy>0 else "LEN"
-def act(cmd):
-    print("[ACT] " if REAL else "[DRY] ", cmd)
-    if not REAL: return
-    {"NEXT": lambda: py.press("right"),
-     "PREV": lambda: py.press("left"),
-     "SCROLL UP": lambda: py.scroll(3),
-     "SCROLL DOWN": lambda: py.scroll(-3),
-     "SELECT": lambda: py.click()}[cmd]()
-o=vision.FaceLandmarkerOptions(base_options=P.BaseOptions(
-  model_asset_path="models/face_landmarker.task"),
-  running_mode=vision.RunningMode.VIDEO,num_faces=1)
-lm=vision.FaceLandmarker.create_from_options(o)
-cap=cv2.VideoCapture(0); t0=time.time(); last=-1
-g=v=c0=c1=0.0; n=0; bel=0; hold=""; hn=0; fire=-9; armed=True
-while True:
-    ok,f=cap.read()
-    if not ok: break
-    f=cv2.flip(f,1); h,w2=f.shape[:2]
-    ts=int((time.time()-t0)*1000)
-    if ts<=last: ts=last+1
-    last=ts
-    r=lm.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB,
-      data=cv2.cvtColor(f,cv2.COLOR_BGR2RGB)),ts)
-    now=time.time(); d="THANG"
-    if r.face_landmarks:
-        p=[(int(q.x*w2),int(q.y*h)) for q in r.face_landmarks[0]]
-        ax,ay=rt(p,LI,LC); bx,by=rt(p,RI,RC); mx,my=(ax+bx)/2,(ay+by)/2
-        if n==0: g,v=mx,my
-        g=A*mx+(1-A)*g; v=AV*my+(1-AV)*v; n+=1
-        if n==45: c0,c1=g,v
-        dx,dy=g-c0,v-c1; d=cls(dx,dy)
-        el=ear(p,EL); er2=ear(p,ER)
-        if max(el,er2)<ETH:
-            bel+=1
+"""Local Eye HCI dashboard. Run python step6_hci.py --help."""
+import argparse
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import threading
+import webbrowser
+from eye_hci.runtime import Runtime
+
+WEB = Path(__file__).resolve().parent / 'web'
+
+def make_handler(runtime):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def send(self, code, data, kind='application/json; charset=utf-8'):
+            self.send_response(code)
+            self.send_header('Content-Type',kind)
+            self.send_header('Content-Length',str(len(data)))
+            self.send_header('Cache-Control','no-store')
+            self.send_header('X-Content-Type-Options','nosniff')
+            self.end_headers()
+            self.wfile.write(data)
+
+        def valid_host(self):
+            return self.headers.get('Host') == f'127.0.0.1:{self.server.server_port}'
+
+        def do_GET(self):
+            if not self.valid_host():
+                self.send(403,b'{}')
+                return
+            path = self.path.split('?')[0]
+            if path == '/api/state':
+                self.send(200,json.dumps(runtime.snapshot()).encode())
+            elif path == '/api/wallpaper':
+                try:
+                    from eye_hci.desktop import wallpaper_image
+                    self.send(200,wallpaper_image(),'image/png')
+                except Exception as exc:
+                    self.send(404,json.dumps({'error':str(exc)}).encode())
+            elif path == '/api/frame':
+                with runtime.lock:
+                    frame = runtime.jpeg
+                self.send(200 if frame else 204,frame or b'','image/jpeg')
+            elif path in ('/','/app.js','/style.css'):
+                name = 'index.html' if path == '/' else path[1:]
+                kind = {'index.html':'text/html; charset=utf-8', 'app.js':'text/javascript; charset=utf-8',
+                        'style.css':'text/css; charset=utf-8'}[name]
+                self.send(200,(WEB/name).read_bytes(),kind)
+            else:
+                self.send(404,b'{}')
+
+        def do_POST(self):
+            # Only local dashboard JavaScript can send control requests; no CORS.
+            expected = f'http://127.0.0.1:{self.server.server_port}'
+            if not self.valid_host() or self.headers.get('Origin') != expected or self.headers.get('X-Eye-HCI') != '1':
+                self.send(403,b'{}')
+                return
+            if self.path != '/api/control':
+                self.send(404,b'{}')
+                return
+            try:
+                size = int(self.headers.get('Content-Length','0'))
+                if not 0 < size < 2048:
+                    raise ValueError('Yêu cầu không hợp lệ.')
+                body = json.loads(self.rfile.read(size))
+                runtime.command(body['action'],body.get('value'))
+                self.send(200,b'{"ok":true}')
+            except Exception as exc:
+                self.send(400,json.dumps({'error':str(exc)}).encode())
+    return Handler
+
+def main():
+    parser = argparse.ArgumentParser(description='Eye HCI • giao diện local, mặc định dry-run')
+    parser.add_argument('--port',type=int,default=8765)
+    parser.add_argument('--camera',type=int,default=0)
+    parser.add_argument('--no-browser',action='store_true')
+    parser.add_argument('--desktop',action='store_true',help='Mở cửa sổ desktop có chế độ nổi thu gọn')
+    parser.add_argument('--real',action='store_true',help='Bật chế độ điều khiển thật, vẫn cần Tiếp tục trong giao diện')
+    args = parser.parse_args()
+    runtime = Runtime(args.camera)
+    if args.real:
+        runtime.command('real',True)
+    try:
+        server = ThreadingHTTPServer(('127.0.0.1',args.port),make_handler(runtime))
+    except OSError:
+        if not args.desktop or args.port == 0:
+            raise
+        # Reuse the running local dashboard rather than compete for its camera.
+        import urllib.request
+        existing = f'http://127.0.0.1:{args.port}'
+        with urllib.request.urlopen(existing+'/api/state',timeout=2) as response:
+            state = json.load(response)
+        if not isinstance(state,dict) or not {'status','profile','events'} <= state.keys():
+            raise ValueError('Cổng đang được ứng dụng khác sử dụng. Chọn --port khác.')
+        from eye_hci.desktop import launch
+        launch(existing)
+        return
+    url = f'http://127.0.0.1:{server.server_port}'
+    print(f'Eye HCI: {url}\nCtrl+C để thoát. Camera chỉ bật khi nhấn nút trong giao diện.')
+    if not args.no_browser and not args.desktop:
+        threading.Timer(.5,lambda:webbrowser.open(url)).start()
+    try:
+        if args.desktop:
+            from eye_hci.desktop import launch
+            worker = threading.Thread(target=server.serve_forever,daemon=True)
+            worker.start()
+            try:
+                launch(url)
+            finally:
+                server.shutdown()
+                worker.join(timeout=3)
         else:
-            if 7<=bel<=15 and now-fire>CD:
-                fire=now; act("SELECT"); print(f"[CMD] SELECT (blink {bel}f)")
-            bel=0
-        if d=="THANG": hold=""; hn=0; armed=True
-        elif d==hold:
-            hn+=1
-            if hn==DW and armed and now-fire>CD: fire=now; hn=0; armed=False; act(CMD[d]); print("[CMD]",CMD[d],d)
-        else: hold=d; hn=1
-        cv2.putText(f,f"{d} dx{dx:+.2f} dy{dy:+.2f}",(15,50),
-          cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2)
-    cv2.imshow("Buoc 6",f)
-    k=cv2.waitKey(1)&0xFF
-    if k in (27,ord("q")): break
-    if k==ord("c") and r.face_landmarks and n>30: c0,c1=g,v
-cap.release(); cv2.destroyAllWindows(); lm.close()
+            server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        runtime.command('stop')
+        if runtime.thread:
+            runtime.thread.join(timeout=5)
+        server.server_close()
+
+if __name__ == '__main__':
+    main()
